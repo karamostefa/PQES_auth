@@ -1,15 +1,34 @@
+
+# Conditions for PQES scheme ############
+
+# 1: p1 < s .. ensure dec     e.g   256 - 265
+# 2: p1*n*s < e .. ensure dec   e.g 721 - 731
+# 3: e*p1 < p .. ensure dec   e.g   987 - 995
+# 4: a > p .. employ mod
+# security
+# p1 large enough e.g., 256 bits
+# k11,k12 size equiv p1:
+
+
 import hashlib
-import random
 import time
 from time import perf_counter
 import gmpy2
 import secrets
+from typing import List, Tuple
+import json
+import os
+
+# --- AUTOMATIC SCRIPT INITIALIZATION CLEANUP ---
+# This ensures that when you run the standalone script, old state doesn't cause a sequence desync
+NVRAM_FILE = "bob_nvram_state.json"
+if os.path.exists(NVRAM_FILE):
+    os.remove(NVRAM_FILE)
 
 def rfrag(x):
     x1 = secure_randint(2, x)
     x2 = x - x1
     return x1, x2
-
 
 def egcd(a, b):
     x0, x1, y0, y1 = 1, 0, 0, 1
@@ -22,67 +41,64 @@ def egcd(a, b):
 
 def modinv(a, m):
     g, x, _ = egcd(a, m)
-    if g != 1: return 0 # raise Exception('Modular inverse does not exist')
+    if g != 1: return 0 
     else: return x % m
-
-
-######
-def modinv_shortcut(a, m):
-    try:
-        return pow(a, -1, m)
-    except ValueError:
-        return 0  # raise Exception('Modular inverse does not exist')
 
 def secure_modinv(a, m):
     try:
-        # gmpy2.invert calculates the modular inverse safely and efficiently
-        # convert back to an int if your codebase expects a standard Python integer
         return int(gmpy2.invert(gmpy2.mpz(a), gmpy2.mpz(m)))
     except ZeroDivisionError:
-        return 0  # gmpy2 throws ZeroDivisionError if the inverse doesn't exist
+        return 0 
 
 def secure_pow(base, exp, mod):
-    """
-    Calculates (base ** exp) % mod safely.
-    - Hardened against side-channel timing attacks.
-    - Highly optimized via gmpy2 C-bindings.
-    """
     try:
-        # 1. Convert all inputs to gmpy2's secure integer type (mpz)
         secure_base = gmpy2.mpz(base)
         secure_exp = gmpy2.mpz(exp)
         secure_mod = gmpy2.mpz(mod)
-        
-        # 2. Compute the modular exponentiation safely
         result = gmpy2.powmod(secure_base, secure_exp, secure_mod)
-        
-        # 3. Convert back to a standard Python integer
         return int(result)
-        
     except ValueError:
-        # Handles edge cases like a negative exponent when no modular inverse exists
         return 0
 
 def secure_randint(a, b):
-    """
-    Returns a cryptographically secure random integer in the range [a, b] (inclusive).
-    """
     if a > b:
         raise ValueError("The lower bound 'a' cannot be greater than the upper bound 'b'.")
-    # 1. Calculate the size of the range (inclusive)
     range_size = (b - a) + 1
-    # 2. Pick a secure random number from 0 up to (range_size - 1)
     random_offset = secrets.randbelow(range_size)
-    # 3. Shift the number back up to start at 'a'
-    return a + random_offset   
-############   PQES scheme ############
+    return a + random_offset 
+
+def save_to_nvram(seq_b: int, seen_timestamps: List[float]) -> None:
+    """Simulates an atomic write-ahead log flush to NVRAM storage."""
+    state = {
+        "seq_b": seq_b,
+        "seen_timestamps": seen_timestamps
+    }
+    with open(NVRAM_FILE, "w") as f:
+        json.dump(state, f)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+def load_from_nvram() -> Tuple[int, List[float]]:
+    """Simulates booting up and recovering protocol state boundaries from NVRAM."""
+    if not os.path.exists(NVRAM_FILE):
+        return 0, []
+    try:
+        with open(NVRAM_FILE, "r") as f:
+            state = json.load(f)
+            return state.get("seq_b", 0), state.get("seen_timestamps", [])
+    except (json.JSONDecodeError, IOError):
+        return 0, []
+
+############  PQES scheme ############
 
 # public param
 p = 203956878356401977405765866929034577280193993314348263094772646453283062722701277632936616063144088173312372882677123879538709400158306567338328279154499698366071906766440037074217117805690872792848149112022286332144876183376326512083574821647933992961249917319836219304274280243803104015000563790123  # 995 prime
 p1 = 97366961280791814622315360764926008528170871540390862931472370525788628065883 # 256 prime
 g = 656692050181897513638241554199181923922955921760928836766304161790553989228223793461834703506872747071705167995972707253940099469869516422893633357693 #  500
 n0 = 511704374946917490638851104912462284144240813125071454126151 # 200
-# m: 200
 
 # receiver param (Bob)
 # receiver sk
@@ -97,6 +113,7 @@ a_b = 987654321*p + 123456789#
 b_b = (a_b*s_b + e_b) %p # 
 K11_b = secure_pow(k1_b, k1_b, p1)  
 K12_b = secure_pow(k1_b, k2_b, p1)
+BobID = 123
 
 # sender param (Alice)
 #sender sk
@@ -106,29 +123,16 @@ k1_a = 4622288097498926496141095869268999988553999555467777785630960635924980552
 k2_a = 11122880974989264961410958692689999885539995554677777856309606359249805529041  # 255 
 
 # sender pk
-a_a = 127654321*p + 888456789#
-b_a = (a_a*s_a + e_a) %p # 
+a_a = 127654321*p + 888456789
+b_a = (a_a*s_a + e_a) %p  
 K11_a = secure_pow(k1_a, k1_a, p1)  
-K12_a = secure_pow(k1_a, k2_a, p1)  
+K12_a = secure_pow(k1_a, k2_a, p1)
+AliceID = 124  
+   
   
-  
-# Conditions for PQES scheme ############
-
-# 1: p1 < s .. ensure dec     e.g   256 - 265
-# 2: p1*n*s < e .. ensure dec   e.g 721 - 731
-# 3: e*p1 < p .. ensure dec   e.g   987 - 995
-# 4: a > p .. employ mod
-# security
-# p1 large enough e.g., 256 bits
-# k11,k12 size equiv p1:
-
-#Alice
 def enc_sig(n, p, p1, k1_a, k2_a, a_b, b_b):
-    
-    #h = hashlib.sha256(n.to_bytes(32, 'big')).hexdigest()
     h = hashlib.sha256(str.encode(str(n))).hexdigest()
     h = int(h,16) % p1
-    #h1 = hashlib.sha256(h.to_bytes(32, 'big')).hexdigest()
     h1 = hashlib.sha256(str.encode(str(h))).hexdigest()
     h1 = int(h1,16) %p1
     
@@ -150,7 +154,6 @@ def enc_sig(n, p, p1, k1_a, k2_a, a_b, b_b):
     
     return u,v,s1,s2, r1,r2
 
-# Bob
 def dec_verf(u, v, s1 ,s2 , p, p1, s_b, e_b, K11_a, K12_a):
     d = (v - u*s_b) %p
     r1 = d //e_b
@@ -158,46 +161,37 @@ def dec_verf(u, v, s1 ,s2 , p, p1, s_b, e_b, K11_a, K12_a):
     d1 = d1 * secure_modinv(r1, p) %p
     n = d1 //s_b
     r2 = d1 %s_b
-    #n_bytes_needed = (n.bit_length() + 7) // 8
-    #h = hashlib.sha256(n.to_bytes(n_bytes_needed, 'big')).hexdigest()
+    
     h = hashlib.sha256(str.encode(str(n))).hexdigest()
     h = int(h,16) %p1
-    #h1 = hashlib.sha256(h.to_bytes(32, 'big')).hexdigest()
     h1 = hashlib.sha256(str.encode(str(h))).hexdigest()
     h1 = int(h1,16) %p1
     
     t = 1
     
-    if r1*r2 %p1 != secure_pow(s1, s2, p1)*secure_pow(K11_a, h+2*s1+r1, p1) %p1: t = 0 #
-    if s1*s2 %p1 != u*secure_pow(K11_a, r1 + h, p1) %p1: t = 0 #
-    if s1*r1*secure_pow(K12_a, h, p1) %p1 != secure_pow(K11_a, s1+h1+2*h, p1) %p1: t = 0 #
-    if s2*r2 %p1 != u*secure_pow(s1, s2, p1)*secure_pow(K11_a, (s1+2*r1-h1)%(p1-1), p1)*secure_pow(K12_a, h, p1) %p1: t = 0 #
+    if r1*r2 %p1 != secure_pow(s1, s2, p1)*secure_pow(K11_a, h+2*s1+r1, p1) %p1: t = 0 
+    if s1*s2 %p1 != u*secure_pow(K11_a, r1 + h, p1) %p1: t = 0 
+    if s1*r1*secure_pow(K12_a, h, p1) %p1 != secure_pow(K11_a, s1+h1+2*h, p1) %p1: t = 0 
+    if s2*r2 %p1 != u*secure_pow(s1, s2, p1)*secure_pow(K11_a, (s1+2*r1-h1)%(p1-1), p1)*secure_pow(K12_a, h, p1) %p1: t = 0 
     
     return n, t, r1, r2
 
-# test: if t==1, Bob acceptes the msg 
-
 ####################### Proposed auth protocol, PQES based  #################################
 
-#initialisation
-CLOCK_DRIFT_WINDOW = 10
+CLOCK_DRIFT_WINDOW = 30  
 dbytes = b"||"
 seq_a = 0
-seq_b = 0  
-bob_seen_seqs = set()  # Bob's replay log: stores (seq, ts) pairs seen from Alice
-####
 
 start_time = perf_counter()
 
-# Alice auth
 def auth_a(seq_a, p, p1, g, n0, k1_a, k2_a, a_b, b_b):
-    xa =  secure_randint(g, p)
+    xa = secure_randint(g, p)
     Xa = secure_pow(g, xa, p)
-    n = secure_randint(2, n0) # nonce
-    u,v,s1,s2, r1,r2 = enc_sig(n, p, p1, k1_a, k2_a, a_b, b_b)
+    n = secure_randint(2, n0) 
+    u, v, s1, s2, r1, r2 = enc_sig(n, p, p1, k1_a, k2_a, a_b, b_b)
     M = (r1*Xa + r2) %p
     ts = int(time.time())
-    hXa = hashlib.sha256(Xa.to_bytes(128, 'big')).hexdigest()
+    hXa = hashlib.sha256(Xa.to_bytes(128, 'big') + dbytes + M.to_bytes(128, 'big')).hexdigest()
     ht = hashlib.sha256(r1.to_bytes(64, 'big') + dbytes + ts.to_bytes(8, 'big') + dbytes + n.to_bytes(32, 'big') + dbytes + seq_a.to_bytes(8, 'big')).digest()
     seq_a_sent = seq_a
     seq_a = seq_a + 1
@@ -208,92 +202,97 @@ n, u, v, s1, s2, M, hXa, xa, r1, r2, ts, ht, seq_a, seq_a_sent = auth_a(seq_a, p
 end_time = perf_counter()
 print('time alice ver ', end_time-start_time) 
 
-##### Round 1: Alice sends (c,σ,M,hXa,t_val) to Bob, c:(u,v), σ:(s1,s2) #####
+##### Round 1: Alice sends (c,σ,M,hXa,ts,ht) to Bob #####
 
 start_time = perf_counter()
-# Bob auth
-def auth_b(seq_b, seq_a_sent, bob_seen_seqs, u, v, s1 ,s2 , M, hXa, ts, ht, p, p1, g, s_b, e_b, K11_a, K12_a):
-    # Prune log — call periodically or at the start of auth_b
-    current_ts = int(time.time())
-    bob_seen_seqs = {(seq, t) for (seq, t) in bob_seen_seqs 
-                 if abs(current_ts - t) < CLOCK_DRIFT_WINDOW}
-    
+
+def auth_b(seq_a_sent, u, v, s1 ,s2 , M, hXa, ts, ht, p, p1, g, s_b, e_b, K11_a, K12_a):
     n_, t_, r1_, r2_ = dec_verf(u, v, s1 ,s2 , p, p1, s_b, e_b, K11_a, K12_a)
     if t_==1:
         Xa_ = secure_modinv(r1_, p)*(M - r2_) %p
-        hXa_ = hashlib.sha256(Xa_.to_bytes(128, 'big')).hexdigest()
+        hXa_ = hashlib.sha256(Xa_.to_bytes(128, 'big') + dbytes + M.to_bytes(128, 'big')).hexdigest()
+        
         ts_ = int(time.time())
+        seq_b, bob_seen_ts = load_from_nvram()
         
-        if seq_a_sent != seq_b:
-            print('err: sequence mismatch'); return
-        # Reject if (seq, ts) pair was seen before
-        replay_key = (seq_a_sent, ts)
-        if replay_key in bob_seen_seqs:
-            print('err: replay detected'); return
+        if abs(ts_ - ts) > CLOCK_DRIFT_WINDOW: return None
+        if ts in bob_seen_ts or seq_a_sent < seq_b: return None 
+                
+        ht_ = hashlib.sha256(r1_.to_bytes(64, 'big') + dbytes + ts.to_bytes(8, 'big') + dbytes + n_.to_bytes(32, 'big') + dbytes + seq_a_sent.to_bytes(8, 'big')).digest()
         
-        ht_ = hashlib.sha256(r1_.to_bytes(64, 'big') + dbytes + ts.to_bytes(8, 'big') + dbytes + n_.to_bytes(32, 'big') + dbytes + seq_b.to_bytes(8, 'big')).digest()
-        if hXa_== hXa and ht == ht_ and abs(ts_ - ts) < CLOCK_DRIFT_WINDOW:
-            # Log this (seq, ts) pair as consumed
-            bob_seen_seqs.add(replay_key)
-            
-            xb =  secure_randint(g, p)
+        if hXa_== hXa and ht == ht_:
+            xb = secure_randint(g, p)
             Xb = secure_pow(g, xb, p)
             M_ = (r2_* Xb) %p ^ r1_ 
-            hXb = hashlib.sha256(Xb.to_bytes(128, 'big')).hexdigest()
+            hXb = hashlib.sha256(Xb.to_bytes(128, 'big') + dbytes + M_.to_bytes(128, 'big')).hexdigest()
+            
             DH_b = secure_pow(Xa_, xb, p)
-            Z_b = hashlib.sha256(DH_b.to_bytes(128, 'big') + dbytes + n_.to_bytes(32, 'big') + dbytes + K11_a.to_bytes(64, 'big') + dbytes + K11_b.to_bytes(64, 'big') + dbytes + u.to_bytes(128, 'big') + dbytes + v.to_bytes(128, 'big') + dbytes + s1.to_bytes(64, 'big') + dbytes + s2.to_bytes(64, 'big')).digest() # session key 
-            auth_bb = hashlib.sha256(K11_b.to_bytes(64, 'big') + dbytes + r2_.to_bytes(64, 'big') + dbytes + K12_b.to_bytes(64, 'big') + dbytes + Z_b).hexdigest() 
-            seq_b = seq_b + 1 
-            return M_, hXb, Z_b, auth_bb, seq_b, bob_seen_seqs
-        else: print('err 1'); return
-    else: print('err 2') ; return   
-
-M_, hXb, Z_b, auth_bb, seq_b, bob_seen_seqs = auth_b(seq_b, seq_a_sent, bob_seen_seqs, u, v, s1 ,s2 , M, hXa, ts, ht, p, p1, g, s_b, e_b, K11_a, K12_a)
-# Update log (ts, seq);  Bob must maintain a log of used (ts, seq) pairs and reject duplicates
+            Z_b = hashlib.sha256(AliceID.to_bytes(2, 'big') + b"||" + BobID.to_bytes(2, 'big') + b"||" + DH_b.to_bytes(128, 'big') + dbytes + n_.to_bytes(32, 'big') + dbytes + K11_a.to_bytes(64, 'big') + dbytes + K11_b.to_bytes(64, 'big') + dbytes + u.to_bytes(128, 'big') + dbytes + v.to_bytes(128, 'big') + dbytes + s1.to_bytes(64, 'big') + dbytes + s2.to_bytes(64, 'big')).digest() 
             
-end_time = perf_counter()
-print('time bob ver ', end_time-start_time) 
-
-###### Round 2: Bob sends M_, hXb, and auth_b to Alice ##########
-
-start_time = perf_counter()
-# Alice DH
-def auth__a(n, p, p1, M_, hXb, xa, u, v, s1, s2, r1, r2, auth_bb, K11_b, K12_b):
-    Xb_ = (secure_modinv(r2, p) * (M_ ^ r1)) %p
-    hXb_ = hashlib.sha256(Xb_.to_bytes(128, 'big')).hexdigest()
-    DH_a = secure_pow(Xb_, xa, p)
-    Z_a = hashlib.sha256(DH_a.to_bytes(128, 'big') + dbytes + n.to_bytes(32, 'big') + dbytes + K11_a.to_bytes(64, 'big') + dbytes + K11_b.to_bytes(64, 'big') + dbytes + u.to_bytes(128, 'big') + dbytes + v.to_bytes(128, 'big') + dbytes + s1.to_bytes(64, 'big') + dbytes + s2.to_bytes(64, 'big')).digest() # session key 
-    auth_b_ = hashlib.sha256(K11_b.to_bytes(64, 'big') + dbytes + r2.to_bytes(64, 'big') + dbytes + K12_b.to_bytes(64, 'big') + dbytes + Z_a).hexdigest()  
+            kmac_b = hashlib.sha256(Z_b + b"||server_finished").digest()
             
-    if hXb_==hXb and auth_b_ == auth_bb: 
-        # send confirmation to Bob HMAC(Z_a, 'confirm')
-        return Z_a
-    else: print('err 3'); return
+            # Compute a MAC token over the unique ephemeral public parameters and identities
+            transcript_b = (
+                Xb.to_bytes(128, 'big') + dbytes + 
+                Xa_.to_bytes(128, 'big') + dbytes + 
+                K11_b.to_bytes(64, 'big') + dbytes + 
+                K12_b.to_bytes(64, 'big')
+            )
+            auth_bb = hashlib.sha256(kmac_b + dbytes + transcript_b).hexdigest() 
+            
+            seq_b = seq_a_sent + 1 
+            bob_seen_ts.append(ts)
+            bob_seen_ts = [t for t in bob_seen_ts if abs(ts_ - t) <= CLOCK_DRIFT_WINDOW]
+            save_to_nvram(seq_b, bob_seen_ts) 
+            
+            return M_, hXb, Z_b, auth_bb
+        else: return None
+    else: return None   
+
+# Safe unpack check sequence
+auth_b_result = auth_b(seq_a_sent, u, v, s1 ,s2 , M, hXa, ts, ht, p, p1, g, s_b, e_b, K11_a, K12_a)
+
+if auth_b_result is None:
+    print("Execution halted due to validation failure inside auth_b.")
+    Z_b = None
+else:
+    M_, hXb, Z_b, auth_bb = auth_b_result
+    end_time = perf_counter()
+    print('time bob ver ', end_time-start_time) 
+
+###### Round 2: Bob sends M_, hXb, and auth_bb to Alice ##########
+
+if Z_b is not None:
+    start_time = perf_counter()
+    def auth__a(n, p, p1, M_, hXb, xa, u, v, s1, s2, r1, r2, auth_bb, K11_b, K12_b):
+        Xb_ = (secure_modinv(r2, p) * (M_ ^ r1)) %p
+        hXb_ = hashlib.sha256(Xb_.to_bytes(128, 'big') + dbytes + M_.to_bytes(128, 'big')).hexdigest()
+        
+        Xa = secure_pow(g, xa, p)
+        
+        DH_a = secure_pow(Xb_, xa, p)
+        Z_a = hashlib.sha256(AliceID.to_bytes(2, 'big') + b"||" + BobID.to_bytes(2, 'big') + b"||" + DH_a.to_bytes(128, 'big') + dbytes + n.to_bytes(32, 'big') + dbytes + K11_a.to_bytes(64, 'big') + dbytes + K11_b.to_bytes(64, 'big') + dbytes + u.to_bytes(128, 'big') + dbytes + v.to_bytes(128, 'big') + dbytes + s1.to_bytes(64, 'big') + dbytes + s2.to_bytes(64, 'big')).digest() 
+        
+        kmac_a = hashlib.sha256(Z_a + b"||server_finished").digest()
+        
+        transcript_a = (
+            Xb_.to_bytes(128, 'big') + dbytes + 
+            Xa.to_bytes(128, 'big') + dbytes + 
+            K11_b.to_bytes(64, 'big') + dbytes + 
+            K12_b.to_bytes(64, 'big')
+        )
+        auth_b_ = hashlib.sha256(kmac_a + dbytes + transcript_a).hexdigest()  
+                
+        if hXb_ == hXb and auth_b_ == auth_bb: 
+            return Z_a
+        else: return None
+        
+    Z_a = auth__a(n, p, p1, M_, hXb, xa, u, v, s1, s2, r1, r2, auth_bb, K11_b, K12_b)  
+
+    if Z_a == Z_b: 
+        print('success!')
+
+    end_time = perf_counter()
+    print('time alice2 ver ', end_time-start_time)
     
-Z_a = auth__a(n, p, p1, M_, hXb, xa, u, v, s1, s2, r1, r2, auth_bb, K11_b, K12_b)  
-
-if Z_a == Z_b: print('seccess!')
-
-end_time = perf_counter()
-print('time alice2 ver ', end_time-start_time) 
-
-
-
-#m = random.randint(pow(10,59), pow(10,60))  # m: 200
-#m = 999999999999999999993453634636363634634634634634699999999991 # m: 200
-
-#start_time = perf_counter()
-#u,v,s1,s2, r1,r2 = enc_sig(m, p, p1, k1_a, k2_a, a_b, b_b)
-#end_time = perf_counter()
-#print('time enc sig ', end_time-start_time) 
-
-#start_time = perf_counter()
-#mm, tt, rr1, rr2 = dec_verf(u, v, s1 ,s2 , p, p1, s_b, e_b, K11_a, K12_a)
-#end_time = perf_counter()
-#print('time dec ver ', end_time-start_time) 
-
-#if mm == m: print("dec correct, t =",tt) 
-
-
-
-
+###### Round 3 if needed: Alice sends HMAC(Z, "Alice finished") ##########
