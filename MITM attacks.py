@@ -20,15 +20,18 @@ import io
 import os
 import random
 import sys
+import time
+import json
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Callable, Iterable, Optional, Set, Tuple
+from unittest.mock import patch
 
 import pytest
 
-MITM_ATTACK_REPETITIONS = 10
+MITM_ATTACK_REPETITIONS = 1000
 DETERMINISTIC_MITM_SEED = 20250623
 
 MODULE_ENV_VAR = "PQES_AUTH_MODULE_PATH"
@@ -73,7 +76,7 @@ class MitmHandshakeDriver:
         # Local state tracking for anti-replay features
         self.seq_a = 0
         self.seq_b = 0
-        self.bob_seen_seqs: Set[Tuple[int, int]] = set()
+        self.bob_seen_seqs: Set[int] = set()
 
     def seed(self, seed: int) -> None:
         random.seed(seed)
@@ -83,6 +86,12 @@ class MitmHandshakeDriver:
         self.seq_a = 0
         self.seq_b = 0
         self.bob_seen_seqs = set()
+        # Clean up state on disk properly without dummy patches
+        if os.path.exists("bob_nvram_state.json"):
+            try:
+                os.remove("bob_nvram_state.json")
+            except OSError:
+                pass
 
     def alice_runs_auth_a(self) -> AliceInitiation:
         with redirect_stdout(io.StringIO()):
@@ -124,11 +133,19 @@ class MitmHandshakeDriver:
             K11_a: Optional[int] = None,
             K12_a: Optional[int] = None,
     ) -> Optional[BobResponse]:
+        # Synchronize driver sequence state into NVRAM if the test suite altered it.
+        try:
+            disk_seq_b, disk_seen = self.pqes.load_from_nvram()
+        except Exception:
+            disk_seq_b, disk_seen = 0, []
+
+        if (self.seq_b != 0 or self.bob_seen_seqs) and (
+                self.seq_b != disk_seq_b or list(self.bob_seen_seqs) != disk_seen):
+            self.pqes.save_to_nvram(self.seq_b, list(self.bob_seen_seqs))
+
         with redirect_stdout(io.StringIO()):
             response = self.pqes.auth_b(
-                self.seq_b,
                 alice.seq_a_sent,
-                self.bob_seen_seqs,
                 alice.u,
                 alice.v,
                 alice.s1,
@@ -149,10 +166,13 @@ class MitmHandshakeDriver:
         if response is None:
             return None
 
-        # Unpack state mutations returned from auth_b
-        M_prime, hXb, Z_b, auth_b, updated_seq_b, updated_seen_seqs = response
+        # Unpack the 4 returned parameters
+        M_prime, hXb, Z_b, auth_b = response
+
+        # Read variables out of NVRAM log
+        updated_seq_b, updated_seen_ts = self.pqes.load_from_nvram()
         self.seq_b = updated_seq_b
-        self.bob_seen_seqs = updated_seen_seqs
+        self.bob_seen_seqs = set(updated_seen_ts)
 
         return BobResponse(M_prime, hXb, Z_b, auth_b)
 
@@ -171,7 +191,7 @@ class MitmHandshakeDriver:
                 alice.xa,
                 alice.u,
                 alice.v,
-                alice.s1,  
+                alice.s1,
                 alice.s2,
                 alice.r1,
                 alice.r2,
@@ -241,8 +261,10 @@ def _load_module_from_path(path: Path, seed: int) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
 
-    with redirect_stdout(io.StringIO()):
-        spec.loader.exec_module(module)
+    # Intercept and block top-level file deletions only during initial module load execution
+    with patch("os.path.exists", return_value=False):
+        with redirect_stdout(io.StringIO()):
+            spec.loader.exec_module(module)
 
     if hasattr(module, "random"):
         module.random.seed(seed)
@@ -318,10 +340,10 @@ def _tamper_alice_first_flight(
         mutated_value = _different_bytes(value, rng)
     else:
         modulus = getattr(pqes, scenario.modulus_name)
+        # Change mutation_name to scenario.mutation_name here:
         mutated_value = _tampered_int(value, modulus, scenario.mutation_name, rng)
 
     return replace(alice, **{scenario.field_name: mutated_value})
-
 
 def _tamper_bob_response(
         bob: BobResponse,
@@ -639,26 +661,18 @@ def test_sanity_honest_handshake_still_succeeds_under_test_adapter() -> None:
 
 
 # =====================================================================
-# ADVANCED ACTIVE CRYPTANALYSIS & EXPLOITATION TEST SUITE
+# ADVANCED ACTIVE ACTIVE CRYPTANALYSIS & EXPLOITATION TEST SUITE
 # =====================================================================
 
 @pytest.mark.integration
 @pytest.mark.security
 def test_mitm_key_compromise_impersonation_leak_isolation() -> None:
-    """Perfect Forward Secrecy (PFS) Validation under Ephemeral Secret Leak.
-
-    Even if an attacker compromises a single session's ephemeral random values
-    (e.g., xa, r1, r2), they must not be able to compute session keys for
-    other independent sessions.
-    """
+    """Perfect Forward Secrecy (PFS) Validation under Ephemeral Secret Leak."""
     scenario_name = "ephemeral-leak-isolation"
 
     for execution_number in range(MITM_ATTACK_REPETITIONS):
         seed = _execution_seed(scenario_name, execution_number)
 
-        # -------------------------------------------------------------
-        # Session 1: Setup a fresh driver instance
-        # -------------------------------------------------------------
         driver1 = _new_mitm_driver()
         driver1.seed(seed)
 
@@ -666,26 +680,19 @@ def test_mitm_key_compromise_impersonation_leak_isolation() -> None:
         bob_session_1 = driver1.bob_runs_auth_b(alice_session_1)
         assert bob_session_1 is not None
 
-        # Attacker steals Session 1 secrets
         leaked_xa = alice_session_1.xa
         leaked_r1 = alice_session_1.r1
 
-        # -------------------------------------------------------------
-        # Session 2: Instantiate a completely new driver to clear sequence logs
-        # -------------------------------------------------------------
         driver2 = _new_mitm_driver()
-        driver2.seed(seed + 9999)  # Use a distinct, fresh seed state
+        driver2.seed(seed + 9999)
 
         alice_session_2 = driver2.alice_runs_auth_a()
         bob_session_2 = driver2.bob_runs_auth_b(alice_session_2)
-
-        # This will now pass because Bob's replay log is fresh!
         assert bob_session_2 is not None
 
-        # Attacker tries to compute Session 2's key using Session 1's leaked parameters
         try:
             Xb_prime = (driver2.pqes.secure_modinv(alice_session_2.r2, driver2.pqes.p) * (
-                        bob_session_2.M_prime ^ leaked_r1)) % driver2.pqes.p
+                    bob_session_2.M_prime ^ leaked_r1)) % driver2.pqes.p
             attacker_dh = driver2.pqes.secure_pow(Xb_prime, leaked_xa, driver2.pqes.p)
 
             assert attacker_dh != int.from_bytes(bob_session_2.dh_secret, 'big'), (
@@ -693,7 +700,6 @@ def test_mitm_key_compromise_impersonation_leak_isolation() -> None:
                 f"a fresh session key on execution {execution_number + 1}."
             )
         except Exception:
-            # If mathematical calculations crash due to mismatched moduli, the isolation holds.
             pass
 
 
@@ -701,11 +707,7 @@ def test_mitm_key_compromise_impersonation_leak_isolation() -> None:
 @pytest.mark.security
 @pytest.mark.parametrize("malicious_element", [0, 1])
 def test_mitm_invalid_element_substitutions_on_dh_exchange(malicious_element: int) -> None:
-    """Invalid Element Attack on Diffie-Hellman (Substitutions of M and M_prime).
-
-    Attacker intercepts the masked keys and substitutes them with trivial parameters
-    (0 or 1) hoping to force the modular exponentiations to collapse into predictable keys.
-    """
+    """Invalid Element Attack on Diffie-Hellman."""
     driver = _new_mitm_driver()
     scenario_name = f"invalid-element-{malicious_element}"
 
@@ -713,15 +715,11 @@ def test_mitm_invalid_element_substitutions_on_dh_exchange(malicious_element: in
         seed = _execution_seed(scenario_name, execution_number)
         driver.seed(seed)
 
-        # 1. Attacker tampers with Alice's masked key M targeting Bob
         alice = driver.alice_runs_auth_a()
         tampered_alice = replace(alice, M=malicious_element)
-
-        # Bob must detect the anomaly or gracefully reject the broken mathematical structure
         bob_response = driver.bob_runs_auth_b(tampered_alice)
 
         if bob_response is not None:
-            # If Bob generates a response, check if Alice catches a malicious M_prime substitution
             tampered_bob = replace(bob_response, M_prime=malicious_element)
             alice_key = driver.alice_runs_auth_a_prime(alice, tampered_bob)
 
@@ -734,11 +732,7 @@ def test_mitm_invalid_element_substitutions_on_dh_exchange(malicious_element: in
 @pytest.mark.integration
 @pytest.mark.security
 def test_mitm_sequence_out_of_order_replay_flooding() -> None:
-    """Sequence Counter Window Sliding & Desynchronization Flood Test.
-
-    An attacker captures a packet and replays it with an intentionally drifted or
-    backward-sliding sequence count to desynchronize Bob's state tracker.
-    """
+    """Sequence Counter Window Sliding & Desynchronization Flood Test."""
     driver = _new_mitm_driver()
     scenario_name = "sequence-drift-flood"
 
@@ -746,18 +740,86 @@ def test_mitm_sequence_out_of_order_replay_flooding() -> None:
         seed = _execution_seed(scenario_name, execution_number)
         driver.seed(seed)
 
-        # Honest Session
         alice_1 = driver.alice_runs_auth_a()
         bob_1 = driver.bob_runs_auth_b(alice_1)
         assert bob_1 is not None
 
-        # Attacker tries to forge an old sequence flight (e.g., seq_a_sent - 5)
         stale_sequence = max(0, alice_1.seq_a_sent - 5)
         malicious_flooded_alice = replace(alice_1, seq_a_sent=stale_sequence)
 
-        # Bob must identify that this sequence has already been cleared or is outside the valid lookahead window
         flood_response = driver.bob_runs_auth_b(malicious_flooded_alice)
         assert flood_response is None, (
             f"Bob accepted a desynchronized/stale sequence sequence flood entry, "
             f"execution {execution_number + 1}."
         )
+
+
+@pytest.mark.integration
+@pytest.mark.security
+def test_nvram_survives_crash_and_blocks_short_window_replay() -> None:
+    """NVRAM Crash Persistence Simulation Test.
+
+    Validates that Bob recovers historical sequence counts and short-window timestamp
+    caches across server power outages / script runtime restarts.
+    """
+    NVRAM_FILE = "bob_nvram_state.json"
+
+    # 1. Clear environment before loading the driver
+    if os.path.exists(NVRAM_FILE):
+        try:
+            os.remove(NVRAM_FILE)
+        except OSError:
+            pass
+
+    driver = _new_mitm_driver()
+
+    # 2. Clear any NVRAM file automatically generated by the module's top-level script import execution
+    if os.path.exists(NVRAM_FILE):
+        try:
+            os.remove(NVRAM_FILE)
+        except OSError:
+            pass
+
+    # Step 1: Alice sends a completely valid first flight
+    alice = driver.alice_runs_auth_a()
+
+    # Bob processes it cleanly. This flushes state to disk NVRAM.
+    response = driver.bob_runs_auth_b(alice)
+    assert response is not None  # Should succeed
+
+    # Simulate a sudden server power outage / crash by resetting in-memory state
+    driver.seq_b = 0
+    driver.bob_seen_seqs = set()
+
+    # Step 2: MITM attempts to replay the same first flight
+    replay_response = driver.bob_runs_auth_b(alice)
+    assert replay_response is None, "Vulnerability: Replay attack succeeded after a crash!"
+
+
+@pytest.mark.integration
+@pytest.mark.security
+def test_mitm_packet_drop_causes_permanent_dos_failure() -> None:
+    """An attacker drops exactly ONE honest message from Alice.
+    Alice increments her counter. The next message she sends must NOT permanently
+    lock out the entire protocol.
+    """
+    driver = _new_mitm_driver()
+    driver.seed(12345)
+
+    # 1. Alice generates Message 1 (seq_a = 0)
+    alice_msg_1 = driver.alice_runs_auth_a()
+
+    # --- ATTACKER DROPS MSG 1 ---
+    # Bob never sees it. Bob's state stays at seq_b = 0.
+    # Alice's local state increments to seq_a = 1.
+
+    # 2. Alice generates a completely honest Message 2 (seq_a_sent = 1)
+    alice_msg_2 = driver.alice_runs_auth_a()
+
+    # 3. Bob tries to process Message 2
+    bob_response = driver.bob_runs_auth_b(alice_msg_2)
+
+    # CRITIQUE VERDICT: This assertion will FAIL in your current code!
+    # Because alice_msg_2 has seq_a_sent = 1, but Bob expects seq_b = 0.
+    # Your code rejects it because seq_a_sent != seq_b (or it isn't tracked properly via a window).
+    assert bob_response is not None, "Protocol entered a permanent DoS lockout state!"
